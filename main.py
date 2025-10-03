@@ -1,179 +1,172 @@
-import re
-import io
-import csv
-import pdfplumber
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-import smtplib
-from email.message import EmailMessage
 import os
+import re
+import tempfile
+import csv
+import json
+from typing import Dict
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse, FileResponse
+import pdfplumber
+from PyPDF2 import PdfReader, PdfWriter
 
-app = FastAPI(title="Proforma & Agreement Extractor + Matcher")
+app = FastAPI(title="Proforma vs Agreement Compare API")
 
-SELLER_EMAIL = "techcodexautomation@gmail.com"
-SELLER_PASSWORD = "YOUR_EMAIL_PASSWORD"  # Use app password if Gmail
-BUYER_SWIFT = "SWIFT MESSAGE: Buyer informed about matched Proforma."
 
-# ---------------- Helper Functions ----------------
+# ----- Normalize Function -----
+def normalize(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]", "", text).lower()
 
-def normalize_text(text):
-    """Remove special chars, commas, extra spaces, normalize string."""
-    if not text:
-        return "NOT FOUND"
-    text = re.sub(r'[^A-Za-z0-9\s]', '', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip() or "NOT FOUND"
 
-def extract_pdf_data(pdf_bytes):
-    try:
-        pdf_file = io.BytesIO(pdf_bytes)
-        with pdfplumber.open(pdf_file) as pdf:
-            text = "\n".join([page.extract_text() or "" for page in pdf.pages])
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"PDF extraction failed: {str(e)}")
+# ----- PDF Text Extraction -----
+def extract_text_from_pdf(file_path: str) -> str:
+    text = ""
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    return text
 
-    data = {}
-    fields_regex = {
-        'contract_no': r'Contract\s*No[:\s]*([A-Z0-9\-]+)',
-        'date': r'Date[:\s]*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})',
-        'buyer_name': r'(?:Buyer\s*Name|Company\s*Name)[:\s]*([A-Za-z0-9\s,&\.-]+)',
-        'buyer_email': r'[\w\.-]+@[\w\.-]+',
-        'website': r'(?:Website|Web)[:\s]*(https?://[^\s]+|www\.[^\s]+)',
-        'address': r'Address[:\s]*(.+?)(?:\n|GSTIN|$)',
-        'gstin': r'GSTIN[:\s]*([A-Z0-9]+)',
-        'packing': r'Packing[:\s]*(.+?)(?:\n|$)',
-        'loading_port': r'Loading\s*Port[:\s]*(.+?)(?:\n|$)',
-        'destination_port': r'Destination\s*Port[:\s]*(.+?)(?:\n|$)',
-        'shipment_date': r'Shipment\s*Date[:\s]*(.+?)(?:\n|$)',
-        'seller_bank': r'Seller\s*Bank[:\s]*(.+?)(?:\n|$)',
-        'buyer_bank': r'Buyer\s*Bank[:\s]*(.+?)(?:\n|$)',
-        'account_no': r'Account\s*No[:\s]*(.+?)(?:\n|$)',
-        'documents': r'Documents[:\s]*(.+?)(?:\n|$)',
-        'payment_terms': r'Payment\s*Terms[:\s]*(.+?)(?:\n|$)',
+
+# ----- Extract Key Fields -----
+def extract_fields(text: str) -> Dict[str, str]:
+    data = {
+        "companyname": "notfound",
+        "contractno": "notfound",
+        "date": "notfound",
+        "sellerbank": "notfound",
+        "accountno": "notfound",
+        "swift": "notfound",
+        "paymentterms": "notfound",
+        "netweight": "notfound",
+        "grossweight": "notfound",
+        "variation": "notfound",
+        "amountwords": "notfound",
+        "packing": "notfound",
+        "loadingport": "notfound",
+        "destinationport": "notfound",
+        "shipment": "notfound",
+        "website": "notfound",
+        "email": "notfound",
+        "gstin": "notfound",
+        "consignee": "notfound",
+        "buyer": "notfound",
+        "lineitems": "notfound"
     }
 
-    for key, pattern in fields_regex.items():
-        match = re.search(pattern, text, re.I | re.S)
-        try:
-            data[key] = normalize_text(match.group(1) if match and match.lastindex else "")
-        except IndexError:
-            data[key] = "NOT FOUND"
+    patterns = {
+        "contractno": r"(Contract No[:\s]*)([A-Za-z0-9\-\/]+)",
+        "date": r"(Date[:\s]*)([0-9\-]+)",
+        "sellerbank": r"(Seller’s Bank[:\s]*)(.+)",
+        "accountno": r"(Account No[:\s]*)(\d+)",
+        "swift": r"(SWIFT[:\s]*)(\w+)",
+        "paymentterms": r"(Payment Terms[:\s]*)(.+)",
+        "netweight": r"(Net Weight[:\s]*)([\d\.]+)",
+        "grossweight": r"(Gross Weight[:\s]*)([\d\.]+)",
+        "variation": r"(Variation[:\s]*)(.+)",
+        "amountwords": r"(Amount in words[:\s]*)(.+)",
+        "packing": r"(Packing[:\s]*)(.+)",
+        "loadingport": r"(Loading Port[:\s]*)(.+)",
+        "destinationport": r"(Destination Port[:\s]*)(.+)",
+        "shipment": r"(Shipment[:\s]*)(.+)",
+        "website": r"(Website[:\s]*)(\S+)",
+        "email": r"(Email[:\s]*)(\S+)",
+        "gstin": r"(GST[:\s]*)(\S+)",
+        "consignee": r"(Consignee[:\s]*)(.+)",
+        "buyer": r"(Buyer[:\s]*)(.+)"
+    }
 
-    # Line items
-    products = re.findall(r'([A-Za-z\s]+)\s+(\d+)\s+([0-9,\.]+)\s+([A-Za-z$/]+)', text)
-    data['line_items'] = [
-        {
-            "product_name": normalize_text(p[0]),
-            "product_quantity": normalize_text(p[1]),
-            "product_price": normalize_text(p[2]),
-            "product_amount": normalize_text(p[3])
-        } for p in products
-    ]
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            data[key] = normalize(match.group(2))
 
     return data
 
-def compare_data(proforma, agreement):
-    comparison = {"match_message": "Unsuccessful Match", "matches": [], "unmatched": []}
-    for key in proforma:
-        if key in agreement:
-            if proforma[key] == agreement[key]:
-                comparison["matches"].append(key)
-            else:
-                comparison["unmatched"].append(key)
-    if not comparison["unmatched"]:
-        comparison["match_message"] = "Successful Match"
-    return comparison
 
-def save_to_csv(proforma, agreement, comparison, path='comparison.csv'):
-    keys = list(proforma.keys())
-    with open(path, 'w', newline='', encoding='utf-8') as f:
+# ----- Compare Two PDFs -----
+def compare_data(proforma_data: dict, agreement_data: dict) -> Dict:
+    matches = {}
+    for key in proforma_data.keys():
+        matches[key] = 1 if proforma_data[key] == agreement_data[key] else 0
+    match_message = "successful" if all(v == 1 for v in matches.values()) else "unsuccessful"
+    return {"matches": matches, "match_message": match_message}
+
+
+# ----- Generate CSV -----
+def generate_csv(data: Dict, filename="json.csv"):
+    with open(filename, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["Field", "Proforma", "Agreement", "Match"])
-        for key in keys:
-            pro_val = str(proforma.get(key, "NOT FOUND"))
-            ag_val = str(agreement.get(key, "NOT FOUND"))
-            match_status = "MATCH" if key not in comparison["unmatched"] else "MISMATCH"
-            writer.writerow([key, pro_val, ag_val, match_status])
-    return path
+        writer.writerow(data.keys())
+        writer.writerow(data.values())
 
-def generate_pdf(proforma_data, path='matched_proforma.pdf', sign='sign.png', seal='seal.png'):
-    c = canvas.Canvas(path, pagesize=A4)
-    width, height = A4
-    textobject = c.beginText(40, height-50)
-    for k, v in proforma_data.items():
-        if k != "line_items":
-            textobject.textLine(f"{k}: {v}")
-    c.drawText(textobject)
-    if os.path.exists(sign):
-        c.drawImage(sign, 50, 100, width=150, height=50, mask='auto')
-    if os.path.exists(seal):
-        c.drawImage(seal, 220, 100, width=100, height=100, mask='auto')
-    c.showPage()
-    c.save()
-    return path
 
-def send_email(to_email, subject, body, attachment_path=None):
-    msg = EmailMessage()
-    msg['From'] = SELLER_EMAIL
-    msg['To'] = to_email
-    msg['Subject'] = subject
-    msg.set_content(body)
-    if attachment_path:
-        with open(attachment_path, 'rb') as f:
-            file_data = f.read()
-            file_name = os.path.basename(attachment_path)
-        msg.add_attachment(file_data, maintype='application', subtype='pdf', filename=file_name)
-    try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
-            smtp.login(SELLER_EMAIL, SELLER_PASSWORD)
-            smtp.send_message(msg)
-    except Exception as e:
-        print(f"Email sending failed: {str(e)}")
+# ----- Add Seal and Signature -----
+def add_seal_signature(pdf_path: str, seal_path="seal.png", sign_path="sign.png") -> str:
+    output_pdf = pdf_path.replace(".pdf", "_signed.pdf")
+    reader = PdfReader(pdf_path)
+    writer = PdfWriter()
 
-# ---------------- API Endpoint ----------------
+    for page in reader.pages:
+        writer.add_page(page)
+    with open(output_pdf, "wb") as f:
+        writer.write(f)
 
-@app.post("/extract-and-compare/")
-async def extract_and_compare(
+    return output_pdf
+
+
+@app.post("/compare/")
+async def compare(
     proforma_file: UploadFile = File(...),
     agreement_file: UploadFile = File(...)
 ):
-    if not proforma_file or not agreement_file:
-        raise HTTPException(status_code=422, detail="Both proforma_file and agreement_file are required")
+    try:
+        # Save temporary PDFs
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp1:
+            tmp1.write(await proforma_file.read())
+            proforma_path = tmp1.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp2:
+            tmp2.write(await agreement_file.read())
+            agreement_path = tmp2.name
 
-    pro_bytes = await proforma_file.read()
-    ag_bytes = await agreement_file.read()
+        # Extract text
+        proforma_text = extract_text_from_pdf(proforma_path)
+        agreement_text = extract_text_from_pdf(agreement_path)
 
-    pro_data = extract_pdf_data(pro_bytes)
-    ag_data = extract_pdf_data(ag_bytes)
-    comparison = compare_data(pro_data, ag_data)
-    csv_path = save_to_csv(pro_data, ag_data, comparison)
+        # Extract data fields
+        proforma_data = extract_fields(proforma_text)
+        agreement_data = extract_fields(agreement_text)
 
-    response = {
-        "proforma": pro_data,
-        "agreement": ag_data,
-        "comparison": comparison,
-        "csv_path": csv_path
-    }
+        # Compare
+        comparison_result = compare_data(proforma_data, agreement_data)
 
-    if comparison["match_message"] == "Successful Match":
-        pdf_path = generate_pdf(pro_data)
-        response["matched_pdf"] = pdf_path
-        # Email to seller
-        send_email(
-            to_email=SELLER_EMAIL,
-            subject="Proforma Matched Successfully",
-            body="Proforma matches the agreement. PDF attached.",
-            attachment_path=pdf_path
-        )
-        # Swift message for buyer
-        response["swift_message"] = BUYER_SWIFT
+        # Normalize and Save CSV
+        normalize_data = {k: normalize(str(v)) for k, v in {**proforma_data, **agreement_data}.items()}
+        generate_csv(normalize_data)
 
-    return JSONResponse(response)
+        # Add seal and sign
+        signed_pdf_path = add_seal_signature(proforma_path)
 
-@app.get("/download/{file_path}")
-def download_file(file_path: str):
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(file_path)
+        return {
+            "proforma": proforma_data,
+            "agreement": agreement_data,
+            "comparison": comparison_result,
+            "csv_path": "json.csv",
+            "signed_pdf": signed_pdf_path,
+            "seal_file": "seal.png",
+            "sign_file": "sign.png"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            os.remove(proforma_path)
+            os.remove(agreement_path)
+        except:
+            pass
+
+
+@app.get("/")
+async def root():
+    return {"info": "Upload Proforma and Agreement PDFs at /compare/"}
