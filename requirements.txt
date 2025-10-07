@@ -6,5 +6,4 @@ pytesseract
 Pillow
 python-multipart
 pdfplumber
-yagmail
 reportlab
